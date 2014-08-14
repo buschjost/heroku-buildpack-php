@@ -82,10 +82,6 @@ mkdir -p $COMPOSER_HOME
 PHP_VERSION=
 HHVM_VERSION=
 runtimes=$(cd $BP_DIR/support/build; ls {php,hhvm}-*)
-if [[ $STACK == "cedar-14" ]]; then
-    # FIXME: remove once HHVM works on cedar-14
-    runtimes=$(cd $BP_DIR/support/build; ls php-*)
-fi
 engine="php"
 if [[ -f "composer.json" ]]; then
     if [[ ! -f "composer.lock" ]]; then
@@ -117,6 +113,18 @@ If the issue persists, please contact support."
                 status "No runtime requirements in composer.json, defaulting to ${runtime_name^^} $runtime_result."
             else
                 status "Resolved $runtime_source requirement for ${runtime_name^^} $runtime_constraint to version $runtime_result."
+                if [[ "$runtime_constraint" == "$runtime_result" || "$runtime_constraint" == "=$runtime_result" ]]; then
+                    recommended_selector="~$runtime_result"
+                    if [[ $runtime_name == "hhvm" ]]; then
+                        recommended_selector="${recommended_selector%.*}" # strip "3.2.0" to just "3.2"; HHVM has different versioning
+                    fi
+                    warning "Your composer.json requires version '$runtime_constraint' for runtime '$runtime_name'.
+This exact-match version constraint means you will not automatically get
+more recent compatible versions of ${runtime_name^^} on push once they are released.
+Such new versions may contain security updates, so we strongly suggest
+you use a more lenient selector like '$recommended_selector' instead.
+See https://devcenter.heroku.com/articles/php-support for more details."
+                fi
             fi
             if [[ $runtime_name == "php" ]]; then
                 PHP_VERSION="$runtime_result"
@@ -159,7 +167,7 @@ if [[ "${HHVM_VERSION}" ]]; then
     # make HHVM accessible
     export PATH=$PATH:/app/.heroku/php/usr/bin
     # so it'll start. remember to use the full path to the binary, or we'll get an infinite loop
-    hhvm() { LD_LIBRARY_PATH=/app/.heroku/php/usr/lib/hhvm:/app/.heroku/php/usr/lib `which hhvm` "$@"; }
+    hhvm() { LD_LIBRARY_PATH=/app/.heroku/php/usr/lib/x86_64-linux-gnu:/app/.heroku/php/usr/lib/hhvm:/app/.heroku/php/usr/lib `which hhvm` "$@"; }
     export -f hhvm
 fi
 
@@ -303,7 +311,7 @@ EOF
 if [[ $engine == "hhvm" ]]; then
     cat > $BUILD_DIR/.profile.d/hhvm.sh <<"EOF"
 export PATH="$PATH:$HOME/.heroku/php/usr/bin"
-hhvm() { LD_LIBRARY_PATH=$HOME/.heroku/php/usr/lib/hhvm:$HOME/.heroku/php/usr/lib `which hhvm` "$@"; }
+hhvm() { LD_LIBRARY_PATH=$HOME/.heroku/php/usr/lib/x86_64-linux-gnu:$HOME/.heroku/php/usr/lib/hhvm:$HOME/.heroku/php/usr/lib `which hhvm` "$@"; }
 export -f hhvm
 EOF
 fi
