@@ -44,7 +44,7 @@ BP_DIR=$(cd $(dirname $0); cd ..; pwd)
 # convenience functions
 source $BP_DIR/bin/common.sh
 
-export_env_dir "$ENV_DIR" '^[A-Z_][A-Z0-9_]*$' '^(HOME|PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|LD_LIBRARY_PATH|STACK)$'
+export_env_dir "$ENV_DIR" '^[A-Z_][A-Z0-9_]*$' '^(HOME|PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|LD_LIBRARY_PATH|STACK|S3_URL|RTVS_URL)$'
 
 BUILDPACK_URL=${BUILDPACK_URL:-} # Anvil has none
 BUILDPACK_BRANCH=$(expr "$BUILDPACK_URL" : '^.*/heroku-buildpack-php#\(..*\)$' || expr "$BUILDPACK_URL" : '^.*/heroku-buildpack-php\.git#\(..*\)$' || true)
@@ -52,11 +52,16 @@ BUILDPACK_BRANCH=${BUILDPACK_BRANCH:-master}
 BUILDPACK_OWNER=$(expr "$BUILDPACK_URL" : '^.*/\(..*\)/heroku-buildpack-php' || true)
 
 BASE_S3_URL=${BASE_S3_URL:-https://lang-php.s3.amazonaws.com/} # Default S3 Url for main buildpack
-S3_URL="master"
 if [[ "$BUILDPACK_BRANCH" != v* && "$BUILDPACK_BRANCH" != "master" ]]; then
     S3_URL="develop"
+    RTVS_URL="14" # develop branches use the version selector service that runs on cedar-14
 fi
-S3_URL="${BASE_S3_URL}dist-${STACK}-${S3_URL}"
+if [[ "$STACK" == "cedar-14" ]]; then
+    RTVS_URL="14" # cedar-14 apps use the version selector service that runs on cedar-14
+fi
+
+S3_URL="${BASE_S3_URL}dist-${STACK}-${S3_URL:-"master"}"
+RTVS_URL="http://php-runtime-version-selector${RTVS_URL:-}.herokuapp.com"
 
 cd $BUILD_DIR
 
@@ -105,7 +110,7 @@ except IOError:
 print json.dumps(ret)
 ' 2> /dev/null) || error "Couldn't parse composer.lock; it must be non-empty and valid JSON.
 Run 'composer update' to have it re-generated or removed by Composer."
-    solver_result=$(echo -n "$solver_payload" | curl --silent --location --fail -H'Content-Type: application/json' -d @- "http://php-runtime-version-selector.herokuapp.com/resolve?default_runtime=php") || error "Failed to resolve runtime requirements.
+    solver_result=$(echo -n "$solver_payload" | curl --silent --location --fail -H'Content-Type: application/json' -d @- "${RTVS_URL}/resolve?default_runtime=php") || error "Failed to resolve runtime requirements.
 If the issue persists, please contact support."
     while IFS="|" read runtime_name runtime_source runtime_constraint runtime_result; do
         if [[ $runtime_result ]]; then
@@ -193,11 +198,10 @@ echo $NGINX_VERSION > $CACHE_DIR/nginx_version
 if [[ "${PHP_VERSION}" ]]; then
     status "Installing PHP extensions..."
     
-    # the newrelic extension logs to stderr which pollutes our build output on each invocation of PHP, and the daemon it launches will prevent the build from finishing, so we disable it for the duration of this build (write to zzz-ext-newrelic.ini so the file is loaded last and overwrites the regular config). we can do this unconditionally here, no harm done if extension or add-on aren't enabled
-    echo "newrelic.enabled = 0
-    newrelic.loglevel = error
-    newrelic.daemon.dont_launch = 3
-    newrelic.daemon.loglevel = error" > "${BUILD_DIR}/.heroku/php/etc/php/conf.d/zzz-ext-newrelic.ini"
+    php() {
+        # the newrelic extension logs to stderr which pollutes our build output on each invocation of PHP, the daemon it launches will prevent the build from finishing, and each call to PHP would be logged to NR as non-web traffic, so we disable it for the duration of this build
+        `which php` -dnewrelic.enabled=0 -dnewrelic.loglevel=error -dnewrelic.daemon.dont_launch=3 -dnewrelic.daemon.loglevel=error "$@"
+    }
     
     exts=()
     if [[ -f "composer.json" ]]; then
@@ -337,10 +341,29 @@ fi
 cat > $BUILD_DIR/.profile.d/newrelic.sh <<"EOF"
 if [[ -n "$NEW_RELIC_LICENSE_KEY" ]]; then
     export NEW_RELIC_APP_NAME=${NEW_RELIC_APP_NAME:-"PHP Application on Heroku"}
-    export NEW_RELIC_LOG=${NEW_RELIC_LOG:-"stderr"}
     export NEW_RELIC_LOG_LEVEL=${NEW_RELIC_LOG_LEVEL:-"warning"}
+
+    # The daemon is a spawned process, invoked by the PHP agent, which is truly
+    # daemonized (i.e., it is disassociated from the controlling TTY and
+    # running in the background). Therefore, the daemon is configured to write
+    # its log output to a file instead of to STDIO 
+    # (see .heroku/php/etc/php/conf.d/ext-newrelic.ini).
+    #
+    # Perpetually tail and redirect the daemon log file to stderr so that it
+    # may be observed via 'heroku logs'.
+    touch /tmp/heroku.ext-newrelic.newrelic-daemon.${PORT}.log
+    tail -qF -n 0 /tmp/heroku.ext-newrelic.newrelic-daemon.${PORT}.log 1>&2 &
 fi
 EOF
+
+if [[ -n "${NEW_RELIC_CONFIG_FILE:-}" ]]; then
+    if [[ ! -f "${NEW_RELIC_CONFIG_FILE}" ]]; then
+        error "Config var 'NEW_RELIC_CONFIG_FILE' points to non existing file
+'${NEW_RELIC_CONFIG_FILE}'"
+    fi
+    notice_inline "Using custom New Relic config '${NEW_RELIC_CONFIG_FILE}'"
+    ( cd $BUILD_DIR/.heroku/php/etc/php/conf.d; ln -s "../../../../../${NEW_RELIC_CONFIG_FILE}" "ext-newrelic.user.ini" )
+fi
 
 if [[ ! -f "Procfile" ]]; then
     bindir=$(composer config bin-dir 2> /dev/null | tail -n 1) # tail, as composer echos outdated version warnings to STDOUT
